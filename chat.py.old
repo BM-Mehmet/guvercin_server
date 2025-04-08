@@ -3,93 +3,71 @@ import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import redis
 import uvicorn
-import firebase_admin
-from firebase_admin import credentials, messaging
-
-# Firebase Admin başlat
-cred = credentials.Certificate("/home/guvercin/guvercin-b5d67-firebase-adminsdk-ieas1-28df47be95.json")  # Anahtar dosyan
-firebase_admin.initialize_app(cred)
 
 # Redis bağlantısı
-r = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=True)
+r = redis.StrictRedis(host='localhost', port=6379, db=0)
 
 # FastAPI uygulaması
 app = FastAPI()
 
-# Aktif WebSocket bağlantılarını tutmak için
+# Kullanıcıların aktif WebSocket bağlantılarını tutmak
 active_connections = {}
 
-# WebSocket endpoint
+# WebSocket bağlantısı kurma ve mesaj alma/gönderme
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     await websocket.accept()
+
+    # Aktif bağlantıyı kaydet
     active_connections[username] = websocket
 
     try:
         while True:
-            data = await websocket.receive_text()
+            data = await websocket.receive_text()  # Gelen veriyi al
             message_data = json.loads(data)
 
             sender = message_data["sender"]
             receiver = message_data["receiver"]
             message = message_data["message"]
 
+            # Kullanıcı ID'lerini al
             sender_id = None
             receiver_id = None
 
             for user in r.smembers("users"):
-                user_name, user_id = user.split(":")
+                user_name, user_id = user.decode("utf-8").split(":")
                 if user_name == sender:
                     sender_id = user_id
                 elif user_name == receiver:
                     receiver_id = user_id
 
             if not sender_id or not receiver_id:
-                continue
+                continue  # Kullanıcılar bulunamadığında mesaj gönderme
 
-            # Mesaj verisini oluştur
-            message_data["timestamp"] = int(time.time())
-            message_data["status"] = "sent"
+            # Mesajı Redis'e kaydet
+            message_data["timestamp"] = int(time.time())  # Zaman damgası ekle
+            message_data["status"] = "sent"  # Mesajın durumu: "sent"
             message_json = json.dumps(message_data)
 
-            # Mesajı Redis'e yaz
+            # Sadece bir tarafın sohbet geçmişine ekle (gerekirse alıcıda da göstermek için)
             r.rpush(f"chat:{sender_id}:{receiver_id}", message_json)
 
-            # Mesajı karşı tarafa ilet (eğer online ise)
+            # Karşı tarafa mesajı ilet
             if receiver in active_connections:
                 await active_connections[receiver].send_text(data)
-            else:
-                # Karşı taraf online değilse -> FCM ile bildirim gönder
-                user_key = f"user:{receiver}"
-                user_info = r.hgetall(user_key)
-
-                fcm_token = user_info.get("fcm_token")
-
-                if fcm_token:
-                    try:
-                        notification = messaging.Message(
-                            notification=messaging.Notification(
-                                title=f"Yeni bir mesajınız var!"
-                            ),
-                            token=fcm_token,
-                        )
-                        response = messaging.send(notification)
-                        print(f"FCM bildirimi gönderildi: {response}")
-                    except Exception as e:
-                        print(f"FCM bildirimi gönderilemedi: {str(e)}")
 
     except WebSocketDisconnect:
-        del active_connections[username]
+        del active_connections[username]  # Bağlantı kesildiğinde bağlantıyı sil
 
-
-# Mesajları alma endpoint'i
+# Mesajları alma işlemi
 @app.get("/get_messages/{sender}/{receiver}")
 async def get_messages(sender: str, receiver: str):
+    # Kullanıcı ID'lerini al
     sender_id = None
     receiver_id = None
 
     for user in r.smembers("users"):
-        user_name, user_id = user.split(":")
+        user_name, user_id = user.decode("utf-8").split(":")
         if user_name == sender:
             sender_id = user_id
         elif user_name == receiver:
@@ -98,16 +76,20 @@ async def get_messages(sender: str, receiver: str):
     if not sender_id or not receiver_id:
         return {"error": "Kullanıcı ID'si bulunamadı"}, 404
 
+    # Mesajları Redis'ten al
     messages_sender_to_receiver = r.lrange(f"chat:{sender_id}:{receiver_id}", 0, -1)
     messages_receiver_to_sender = r.lrange(f"chat:{receiver_id}:{sender_id}", 0, -1)
 
-    all_messages = [json.loads(msg) for msg in messages_sender_to_receiver + messages_receiver_to_sender]
+    # Mesajları birleştir ve zaman damgasına göre sırala
+    all_messages = []
+    all_messages.extend([json.loads(msg) for msg in messages_sender_to_receiver])
+    all_messages.extend([json.loads(msg) for msg in messages_receiver_to_sender])
+
     all_messages.sort(key=lambda x: x['timestamp'])
 
     return all_messages
 
-
-# Uygulamayı başlat
+# Uvicorn ile uygulamayı başlat
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5004)
 
