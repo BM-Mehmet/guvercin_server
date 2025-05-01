@@ -1,25 +1,49 @@
 import json
 import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import redis
 import uvicorn
+import mysql.connector
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, messaging
+import redis
+from connectdb import get_connection
 
-# Firebase Admin başlat
-cred = credentials.Certificate("/home/guvercin/guvercin-b5d67-firebase-adminsdk-ieas1-28df47be95.json")  # Anahtar dosyan
-firebase_admin.initialize_app(cred)
+# Veritabanı bağlantısı
+db_connection, cursor = get_connection()
 
 # Redis bağlantısı
-r = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=True)
+redis_client = redis.Redis(host="localhost", port=6379, db=0)
+
+# Firebase Admin başlatılıyor
+cred = credentials.Certificate("/home/ubuntu/guvercin/guvercin-b5d67-firebase-adminsdk-ieas1-28df47be95.json")
+firebase_admin.initialize_app(cred)
 
 # FastAPI uygulaması
 app = FastAPI()
 
-# Aktif WebSocket bağlantılarını tutmak için
+# Aktif WebSocket bağlantılarını tutar
 active_connections = {}
 
-# WebSocket endpoint
+# Bildirim gönderme fonksiyonu
+def send_fcm_notification(receiver):
+    try:
+        fcm_token = redis_client.hget(f"user:{receiver}", "fcm_token")
+        if fcm_token:
+            notification = messaging.Message(
+                notification=messaging.Notification(
+                    title="Yeni bir mesajınız var!",
+                ),
+                token=fcm_token.decode()
+            )
+            response = messaging.send(notification)
+            print(f"FCM bildirimi gönderildi: {response}")
+        else:
+            print(f"⚠️ {receiver} için FCM token bulunamadı.")
+    except Exception as e:
+        print(f"FCM bildirimi gönderilemedi: {e}")
+
+# WebSocket mesajlaşma endpoint'i
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     await websocket.accept()
@@ -32,82 +56,78 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
 
             sender = message_data["sender"]
             receiver = message_data["receiver"]
-            message = message_data["message"]
+            msg_type = message_data.get("type", "text")
+            content = message_data.get("message", None)
+            file_url = message_data.get("file_url", None)
+            file_name = message_data.get("file_name", None)
+            mime_type = message_data.get("mime_type", None)
 
-            sender_id = None
-            receiver_id = None
+            # Mesajı veritabanına kaydet
+            cursor.execute("""
+                INSERT INTO messages (sender, receiver, type, content, file_url, file_name, mime_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (sender, receiver, msg_type, content, file_url, file_name, mime_type))
+            db_connection.commit()
+            message_id = cursor.lastrowid
 
-            for user in r.smembers("users"):
-                user_name, user_id = user.split(":")
-                if user_name == sender:
-                    sender_id = user_id
-                elif user_name == receiver:
-                    receiver_id = user_id
-
-            if not sender_id or not receiver_id:
-                continue
-
-            # Mesaj verisini oluştur
+            # Gönderilecek veri
+            message_data["message_id"] = message_id
             message_data["timestamp"] = int(time.time())
             message_data["status"] = "sent"
-            message_json = json.dumps(message_data)
 
-            # Mesajı Redis'e yaz
-            r.rpush(f"chat:{sender_id}:{receiver_id}", message_json)
+            json_message = json.dumps(message_data)
 
-            # Mesajı karşı tarafa ilet (eğer online ise)
-            if receiver in active_connections:
-                await active_connections[receiver].send_text(data)
+            # Alıcı aktifse mesajı gönder, değilse FCM bildirimi gönder
+            receiver_ws = active_connections.get(receiver)
+
+            if receiver_ws:
+                try:
+                    await receiver_ws.send_text(json_message)
+                    cursor.execute("UPDATE messages SET delivered = TRUE WHERE id = %s", (message_id,))
+                    db_connection.commit()
+                except Exception as e:
+                    print(f"WebSocket üzerinden mesaj gönderilemedi: {e}")
+                    send_fcm_notification(receiver)
             else:
-                # Karşı taraf online değilse -> FCM ile bildirim gönder
-                user_key = f"user:{receiver}"
-                user_info = r.hgetall(user_key)
-
-                fcm_token = user_info.get("fcm_token")
-
-                if fcm_token:
-                    try:
-                        notification = messaging.Message(
-                            notification=messaging.Notification(
-                                title=f"Yeni bir mesajınız var!"
-                            ),
-                            token=fcm_token,
-                        )
-                        response = messaging.send(notification)
-                        print(f"FCM bildirimi gönderildi: {response}")
-                    except Exception as e:
-                        print(f"FCM bildirimi gönderilemedi: {str(e)}")
+                send_fcm_notification(receiver)
 
     except WebSocketDisconnect:
-        del active_connections[username]
+        print(f"{username} bağlantısı kesildi.")
+        active_connections.pop(username, None)
 
+# Mesajları listeleyen endpoint
+@app.get("/get_messages/{user1}/{user2}")
+async def get_messages(user1: str, user2: str):
+    cursor.execute("""
+        SELECT * FROM messages
+        WHERE ((sender = %s AND receiver = %s) OR (sender = %s AND receiver = %s))
+        AND id NOT IN (
+            SELECT message_id FROM deleted_messages WHERE user = %s
+        )
+        ORDER BY timestamp ASC
+    """, (user1, user2, user2, user1, user1))
+    messages = cursor.fetchall()
+    for msg in messages:
+        msg["timestamp"] = int(msg["timestamp"].timestamp())
+    return messages
 
-# Mesajları alma endpoint'i
-@app.get("/get_messages/{sender}/{receiver}")
-async def get_messages(sender: str, receiver: str):
-    sender_id = None
-    receiver_id = None
+# Mesajı silen endpoint
+@app.delete("/delete_message/{username}/{message_id}")
+async def delete_message(username: str, message_id: int):
+    cursor.execute("SELECT * FROM messages WHERE id = %s", (message_id,))
+    result = cursor.fetchone()
+    if not result:
+        return {"status": "error", "message": "Mesaj bulunamadı"}
 
-    for user in r.smembers("users"):
-        user_name, user_id = user.split(":")
-        if user_name == sender:
-            sender_id = user_id
-        elif user_name == receiver:
-            receiver_id = user_id
+    cursor.execute("SELECT * FROM deleted_messages WHERE user = %s AND message_id = %s", (username, message_id))
+    if cursor.fetchone():
+        return {"status": "error", "message": "Mesaj zaten silinmiş"}
 
-    if not sender_id or not receiver_id:
-        return {"error": "Kullanıcı ID'si bulunamadı"}, 404
+    cursor.execute("INSERT INTO deleted_messages (user, message_id) VALUES (%s, %s)", (username, message_id))
+    db_connection.commit()
+    return {"status": "success", "message": "Mesaj silindi"}
 
-    messages_sender_to_receiver = r.lrange(f"chat:{sender_id}:{receiver_id}", 0, -1)
-    messages_receiver_to_sender = r.lrange(f"chat:{receiver_id}:{sender_id}", 0, -1)
-
-    all_messages = [json.loads(msg) for msg in messages_sender_to_receiver + messages_receiver_to_sender]
-    all_messages.sort(key=lambda x: x['timestamp'])
-
-    return all_messages
-
-
-# Uygulamayı başlat
+# Uygulama başlatma
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5004)
 

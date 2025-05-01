@@ -2,92 +2,95 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict
-import redis
+from connectdb import get_connection
 import uvicorn
 
 app = FastAPI()
 
-# Redis bağlantısı
-r = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=True)
-
-# CORS ayarları
+# CORS ayarları - Uygulamanın farklı alanlardan erişimine izin verir
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Tüm domainlerden gelen taleplere izin verir
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Tüm HTTP metodlarına izin verir
+    allow_headers=["*"],  # Tüm header'lara izin verir
 )
 
-# Aktif WebSocket bağlantılarını tutan sözlük
+# Aktif WebSocket bağlantıları, her bir kullanıcıya WebSocket nesnesi
 active_connections: Dict[str, WebSocket] = {}
 
 @app.get("/chats/{username}")
 async def get_chats(username: str):
     """
     Kullanıcının mesajlaştığı diğer kişilerin listesini döner.
+    Bu API, kullanıcının gönderdiği veya aldığı mesajlara göre sohbet ettiği diğer kullanıcıları getirir.
     """
-    user_id = None
-    # Kullanıcı bilgilerini Redis'ten al
-    for user in r.smembers("users"):
-        stored_username, stored_user_id = user.split(":")
-        if stored_username == username:
-            user_id = stored_user_id
-            break
+    try:
+        # Veritabanı bağlantısı ve cursor
+        db_connection, cursor = get_connection()
 
-    # Kullanıcı bulunamadıysa 404 dön
-    if not user_id:
-        return JSONResponse(status_code=404, content={"message": "User not found"})
+        # Kullanıcıya ait sohbetleri sorgula
+        query = """
+        SELECT DISTINCT
+            CASE
+                WHEN sender = %s THEN receiver
+                WHEN receiver = %s THEN sender
+            END AS other_user
+        FROM messages
+        WHERE (sender = %s OR receiver = %s)
+        AND id NOT IN (
+            SELECT message_id FROM deleted_messages WHERE user = %s
+        )
+        """
+        # Parametreleri 4 kez aynı şekilde gönderiyoruz
+        cursor.execute(query, (username, username, username, username, username))
+        results = cursor.fetchall()
 
-    chats = set()
-    # Redis'ten chat anahtarlarını al
-    chat_keys = r.keys(f"chat:{user_id}:*") + r.keys(f"chat:*:{user_id}")
-    
-    for key in chat_keys:
-        parts = key.split(":")
-        other_user_id = parts[2] if parts[1] == user_id else parts[1]
+        if not results:
+            return JSONResponse(status_code=404, content={"message": "Hiç sohbet yok."})
 
-        # Diğer kullanıcıyı bul ve listeye ekle
-        for user in r.smembers("users"):
-            stored_username, stored_user_id = user.split(":")
-            if stored_user_id == other_user_id and stored_username != username:
-                chats.add(stored_username)
-                break
+        # Kullanıcıların listesi döndürülür
+        users = [row['other_user'] for row in results]
+        print(f"Kullanıcılar: {users}")
+        
+        return {"users": users}
 
-    # Eğer sohbet bulunmazsa 404 dön
-    if not chats:
-        return JSONResponse(status_code=404, content={"message": "No other users found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    return {"users": list(chats)}
+    finally:
+        # Bağlantıyı ve cursor'u kapat
+        cursor.close()
+        db_connection.close()
 
 @app.websocket("/ws/{username}")
 async def websocket_endpoint(websocket: WebSocket, username: str):
     """
     WebSocket bağlantısı kurar ve mesaj gönderimini sağlar.
+    Bu API, kullanıcılar arasında anlık mesajlaşma işlemini WebSocket ile sağlar.
     """
-    await websocket.accept()
-    active_connections[username] = websocket
-    print(f"{username} joined.")
+    await websocket.accept()  # WebSocket bağlantısını kabul et
+    active_connections[username] = websocket  # Bağlantıyı aktif bağlantılar listesine ekle
+    print(f"{username} bağlandı.")
 
     try:
         while True:
-            data = await websocket.receive_json()
-            sender = data.get("sender")
-            receiver = data.get("receiver")
-            message = data.get("message")
+            data = await websocket.receive_json()  # WebSocket'ten gelen veriyi JSON olarak al
+            sender = data.get("sender")  # Gönderen kullanıcı adı
+            receiver = data.get("receiver")  # Alıcı kullanıcı adı
+            message = data.get("message")  # Gönderilen mesaj
 
-            # Gönderilen mesajı alıcıya yönlendir
-            print(f"{sender} -> {receiver}: {message}")
-
+            # Alıcı aktifse, mesajı alıcıya gönder
             if receiver in active_connections:
                 await active_connections[receiver].send_json({
-                    "sender": sender,
-                    "receiver": receiver,
-                    "message": message
+                    "type": "new_message",  # Mesaj türü
+                    "from": sender,         # Gönderen kullanıcı
+                    "message": message      # Mesaj içeriği
                 })
 
     except WebSocketDisconnect:
-        print(f"{username} disconnected")
+        # Bağlantı koparsa, aktif bağlantılardan çıkar
+        print(f"{username} bağlantısı koptu.")
         active_connections.pop(username, None)
 
 # Uvicorn ile uygulamayı başlat
