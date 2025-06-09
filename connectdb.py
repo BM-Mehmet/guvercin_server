@@ -1,4 +1,3 @@
-# connectdb.py
 import mysql.connector
 
 def get_connection():
@@ -9,6 +8,6 @@ def get_connection():
         'database': 'guvercin'
     }
     db_connection = mysql.connector.connect(**db_config)
-    cursor = db_connection.cursor(dictionary=True)  # Cursor ekleme
+    cursor = db_connection.cursor(dictionary=True)
     return db_connection, cursor
 
