@@ -2,16 +2,21 @@ import os
 import json
 import uuid
 from datetime import datetime, timezone
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Body
 from fastapi.responses import FileResponse
 import uvicorn
+
 import firebase_admin
 from firebase_admin import credentials, messaging
 import redis
-from connectdb import get_connection
 
+from connectdb import get_connection  # Senin DB bağlantını getiren fonksiyon
+
+# Redis ayarları
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
 
+# Firebase admin başlatma
 cred = credentials.Certificate("/home/gcloude/guvercin/guvercin-b5d67-firebase-adminsdk-ieas1-28df47be95.json")
 firebase_admin.initialize_app(cred)
 
@@ -20,6 +25,20 @@ app = FastAPI()
 active_connections: dict[str, WebSocket] = {}
 USER_FILES_PATH = "/home/gcloude/download_file"
 download_tokens: dict[str, str] = {}
+
+@app.get("/public_key/{username}")
+async def get_public_key(username: str):
+    key = f"user:{username}"
+    if not redis_client.exists(key):
+        raise HTTPException(status_code=404, detail="User not found")
+    public_key = redis_client.hget(key, "public_key")
+    if public_key:
+        return {"username": username, "public_key": public_key.decode()}
+    else:
+        raise HTTPException(status_code=404, detail="Public key not found")
+
+
+
 
 def send_fcm_notification(receiver: str):
     try:
@@ -32,11 +51,11 @@ def send_fcm_notification(receiver: str):
                 token=fcm_token.decode()
             )
             response = messaging.send(message)
-            print(f"FCM bildirimi gonderildi: {response}")
+            print(f"FCM bildirimi gönderildi: {response}")
         else:
-            print(f"{receiver} icin FCM token bulunamadi.")
+            print(f"{receiver} için FCM token bulunamadı.")
     except Exception as e:
-        print(f"FCM bildirimi gonderilemedi: {e}")
+        print(f"FCM bildirimi gönderilemedi: {e}")
 
 async def save_file(file: bytes, username: str, filename: str) -> str:
     user_folder = os.path.join(USER_FILES_PATH, username)
@@ -53,7 +72,7 @@ async def save_file(file: bytes, username: str, filename: str) -> str:
 async def websocket_endpoint(websocket: WebSocket, username: str):
     await websocket.accept()
     active_connections[username] = websocket
-    print(f"{username} baglandi.")
+    print(f"{username} bağlandı.")
 
     try:
         while True:
@@ -105,7 +124,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
                     cursor.close()
                     conn.close()
                 except Exception as e:
-                    print(f"WebSocket mesaji gonderilemedi: {e}")
+                    print(f"WebSocket mesajı gönderilemedi: {e}")
                     send_fcm_notification(receiver)
             else:
                 send_fcm_notification(receiver)
@@ -113,14 +132,14 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             await websocket.send_text(json_message)
 
     except WebSocketDisconnect:
-        print(f"🔌 {username} baglantisi kesildi.")
+        print(f"🔌 {username} bağlantısı kesildi.")
         active_connections.pop(username, None)
 
 @app.websocket("/ws/{username}/seen")
 async def websocket_seen(websocket: WebSocket, username: str):
     await websocket.accept()
     active_connections[username] = websocket
-    print(f"👁 {username} seen guncelleyiciye baglandi.")
+    print(f"👁 {username} seen güncelleyiciye bağlandı.")
 
     try:
         while True:
@@ -140,10 +159,10 @@ async def websocket_seen(websocket: WebSocket, username: str):
                 try:
                     await ws.send_text(seen_data)
                 except Exception as e:
-                    print(f"{ws_user} icin seen verisi gonderilemedi: {e}")
+                    print(f"{ws_user} için seen verisi gönderilemedi: {e}")
 
     except WebSocketDisconnect:
-        print(f"👁🔌 {username} seen baglantisi kesildi.")
+        print(f"👁🔌 {username} seen bağlantısı kesildi.")
         active_connections.pop(username, None)
 
 @app.get("/download_file/{username}/{file_name}")
@@ -159,13 +178,13 @@ def download_file(username: str, file_name: str, background_tasks: BackgroundTas
     conn.close()
 
     if not result:
-        raise HTTPException(status_code=404, detail="Dosya bilgisi bulunamadi.")
+        raise HTTPException(status_code=404, detail="Dosya bilgisi bulunamadı.")
 
     file_path = result["file_url"]
     message_id = result["id"]
 
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=410, detail="Dosya fiziksel olarak mevcut degil.")
+        raise HTTPException(status_code=410, detail="Dosya fiziksel olarak mevcut değil.")
 
     def delete_message():
         try:
@@ -175,49 +194,63 @@ def download_file(username: str, file_name: str, background_tasks: BackgroundTas
             cursor2.close()
             conn2.close()
         except Exception as e:
-            print("Veritabani silme hatasi:", e)
+            print("Veritabanı silme hatası:", e)
 
-   #background_tasks.add_task(delete_message)
+    # İstersen dosya indirildikten sonra mesaj silinebilir
+    # background_tasks.add_task(delete_message)
 
     return FileResponse(
         path=file_path,
         filename=os.path.basename(file_path),
         media_type="application/octet-stream"
     )
-@app.delete("/delete_message/{message_id}")
-def delete_message(message_id: int):
-    # 1) Mesaj bilgisini al (fiziksel dosya yolu için)
+
+@app.post("/delete_message/{message_id}")
+async def delete_message(message_id: int, payload: dict = Body(...)):
+    username = payload.get("username")
+    if not username:
+        raise HTTPException(status_code=400, detail="Kullanıcı adı gerekli.")
+
     conn, cursor = get_connection()
-    cursor.execute("SELECT file_url FROM messages WHERE id = %s", (message_id,))
-    row = cursor.fetchone()
-    if not row:
+    cursor.execute(
+        "SELECT 1 FROM deleted_messages WHERE message_id = %s AND user = %s",
+        (message_id, username)
+    )
+    existing = cursor.fetchone()
+    if existing:
         cursor.close()
         conn.close()
-        raise HTTPException(status_code=404, detail="Mesaj bulunamadı.")
-    
-    file_path = row.get("file_url")
-    
-    # 2) Veritabanından mesaj kaydını sil
-    cursor.execute("DELETE FROM messages WHERE id = %s", (message_id,))
+        return {"status": "already_deleted"}
+
+    cursor.execute(
+        "INSERT INTO deleted_messages (message_id, user) VALUES (%s, %s)",
+        (message_id, username)
+    )
     conn.commit()
     cursor.close()
     conn.close()
-    return {"status": "success", "message": f"Mesaj {message_id} silindi."}
 
-#background_tasks.add_task(delete_message)
+    return {"status": "deleted"}
 
 @app.get("/get_messages/{user1}/{user2}")
 async def get_messages(user1: str, user2: str):
     conn, cursor = get_connection()
+
     cursor.execute("""
         SELECT * FROM messages
-        WHERE (sender = %s AND receiver = %s) OR (sender = %s AND receiver = %s)
-        ORDER BY timestamp ASC
-    """, (user1, user2, user2, user1))
+        WHERE ((sender = %s AND receiver = %s)
+               OR (sender = %s AND receiver = %s))
+          AND id NOT IN (
+              SELECT message_id FROM deleted_messages WHERE user = %s
+          )
+        ORDER BY timestamp
+    """, (user1, user2, user2, user1, user1))
+
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
 
+    # Zaman damgalarını uygun hale getir
     for row in rows:
         if "timestamp" in row and row["timestamp"]:
             row["timestamp"] = int(row["timestamp"].timestamp())
@@ -225,6 +258,7 @@ async def get_messages(user1: str, user2: str):
             row["seen_at"] = row["seen_at"].isoformat()
 
     return rows
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5004)
